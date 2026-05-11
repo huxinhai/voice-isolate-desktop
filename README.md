@@ -24,7 +24,7 @@ All outputs are written as 16 kHz mono PCM WAV files.
 ## Requirements
 
 - CMake 3.20 or newer
-- A C++17 compiler
+- A C++20 compiler
 - macOS for the current prototype
 - macOS system audio capture permission when using ProcessTap
 
