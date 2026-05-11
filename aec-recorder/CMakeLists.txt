@@ -40,6 +40,7 @@ if(APPLE)
         "-framework CoreAudio"
         "-framework AudioToolbox"
         "-framework CoreFoundation"
+        "-framework Foundation"
     )
     target_compile_options(aec-recorder PRIVATE -fobjc-arc)
 elseif(WIN32)

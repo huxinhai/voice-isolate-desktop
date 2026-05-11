@@ -18,13 +18,17 @@
 
 static std::atomic<bool> g_running{true};
 
-static void signal_handler(int) {
-    g_running = false;
+static void signal_handler(int sig) {
+    g_running.store(false, std::memory_order_relaxed);
 }
 
 int main(int argc, char* argv[]) {
-    signal(SIGINT, signal_handler);
-    signal(SIGTERM, signal_handler);
+    struct sigaction sa = {};
+    sa.sa_handler = signal_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
 
     const int capture_rate = 48000;
     const int process_rate = 16000;
@@ -117,12 +121,16 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    printf("Recording... (Ctrl+C to stop)\n");
+    fflush(stdout);
+
     // Main loop - wait for Ctrl+C
     while (g_running.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
     printf("\nStopping...\n");
+    fflush(stdout);
     capture->stop();
 
     // Close WAV files (finalizes headers)

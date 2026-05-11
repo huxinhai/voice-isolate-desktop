@@ -1,6 +1,8 @@
 #import "coreaudio_capture.h"
-#include <AudioToolbox/AudioToolbox.h>
-#include <CoreAudio/CoreAudio.h>
+#import <AudioToolbox/AudioToolbox.h>
+#import <CoreAudio/CoreAudio.h>
+#import <CoreAudio/AudioHardwareTapping.h>
+#import <CoreAudio/CATapDescription.h>
 #include <atomic>
 #include <cstring>
 #include <vector>
@@ -15,34 +17,42 @@ public:
     bool is_running() const override { return running_.load(); }
 
 private:
-    static OSStatus io_proc(AudioDeviceID device,
-                           const AudioTimeStamp* now,
-                           const AudioBufferList* input_data,
-                           const AudioTimeStamp* input_time,
-                           AudioBufferList* output_data,
-                           const AudioTimeStamp* output_time,
-                           void* client_data);
+    static OSStatus mic_io_proc(AudioDeviceID device,
+                                const AudioTimeStamp* now,
+                                const AudioBufferList* input_data,
+                                const AudioTimeStamp* input_time,
+                                AudioBufferList* output_data,
+                                const AudioTimeStamp* output_time,
+                                void* client_data);
 
-    bool create_aggregate_device();
-    void destroy_aggregate_device();
+    bool setup_process_tap();
+    bool setup_mic_capture();
+    void teardown();
+
     AudioDeviceID find_default_input_device();
     AudioDeviceID find_default_output_device();
+    CFStringRef get_device_uid(AudioDeviceID device);
+    pid_t get_own_pid_object_id();
 
     AudioCaptureConfig config_;
     AudioCaptureCallback callback_;
     std::atomic<bool> running_{false};
 
-    AudioDeviceID aggregate_device_ = kAudioObjectUnknown;
-    AudioDeviceIOProcID io_proc_id_ = nullptr;
+    // Mic capture via default input device
+    AudioDeviceID mic_device_ = kAudioObjectUnknown;
+    AudioDeviceIOProcID mic_io_proc_id_ = nullptr;
 
-    AudioDeviceID input_device_ = kAudioObjectUnknown;
-    AudioDeviceID output_device_ = kAudioObjectUnknown;
+    // System audio via ProcessTap + Aggregate Device
+    AudioObjectID process_tap_id_ = kAudioObjectUnknown;
+    AudioDeviceID tap_aggregate_device_ = kAudioObjectUnknown;
+    AudioDeviceIOProcID tap_io_proc_id_ = nullptr;
 
-    // Process tap for system audio
-    AudioObjectID tap_id_ = kAudioObjectUnknown;
-
-    int input_channels_ = 0;
-    int output_channels_ = 0;
+    // Shared ring buffer for speaker data (written by tap callback, read by mic callback)
+    std::mutex speaker_mutex_;
+    std::vector<float> speaker_ring_;
+    size_t speaker_write_pos_ = 0;
+    size_t speaker_read_pos_ = 0;
+    static constexpr size_t SPEAKER_RING_SIZE = 48000; // 1 second at 48kHz
 };
 
 AudioDeviceID CoreAudioCapture::find_default_input_device() {
@@ -61,7 +71,7 @@ AudioDeviceID CoreAudioCapture::find_default_output_device() {
     AudioDeviceID device = kAudioObjectUnknown;
     UInt32 size = sizeof(device);
     AudioObjectPropertyAddress addr = {
-        kAudioHardwarePropertyDefaultOutputDevice,
+        kAudioHardwarePropertyDefaultSystemOutputDevice,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
@@ -69,157 +79,173 @@ AudioDeviceID CoreAudioCapture::find_default_output_device() {
     return device;
 }
 
-bool CoreAudioCapture::create_aggregate_device() {
-    input_device_ = find_default_input_device();
-    output_device_ = find_default_output_device();
-
-    if (input_device_ == kAudioObjectUnknown || output_device_ == kAudioObjectUnknown) {
-        fprintf(stderr, "Cannot find default input/output device\n");
-        return false;
-    }
-
-    // Get device UIDs
-    CFStringRef input_uid = nullptr;
-    CFStringRef output_uid = nullptr;
+CFStringRef CoreAudioCapture::get_device_uid(AudioDeviceID device) {
+    CFStringRef uid = nullptr;
     UInt32 size = sizeof(CFStringRef);
-
-    AudioObjectPropertyAddress uid_addr = {
+    AudioObjectPropertyAddress addr = {
         kAudioDevicePropertyDeviceUID,
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
+    AudioObjectGetPropertyData(device, &addr, 0, nullptr, &size, &uid);
+    return uid;
+}
 
-    AudioObjectGetPropertyData(input_device_, &uid_addr, 0, nullptr, &size, &input_uid);
-    AudioObjectGetPropertyData(output_device_, &uid_addr, 0, nullptr, &size, &output_uid);
+pid_t CoreAudioCapture::get_own_pid_object_id() {
+    pid_t pid = getpid();
+    AudioObjectID processObjectID = kAudioObjectUnknown;
+    UInt32 size = sizeof(processObjectID);
+    AudioObjectPropertyAddress addr = {
+        kAudioHardwarePropertyTranslatePIDToProcessObject,
+        kAudioObjectPropertyScopeGlobal,
+        kAudioObjectPropertyElementMain
+    };
+    UInt32 qualifierSize = sizeof(pid);
+    AudioObjectGetPropertyData(kAudioObjectSystemObject, &addr, qualifierSize, &pid, &size, &processObjectID);
+    return processObjectID;
+}
 
-    if (!input_uid || !output_uid) {
-        fprintf(stderr, "Cannot get device UIDs\n");
-        if (input_uid) CFRelease(input_uid);
-        if (output_uid) CFRelease(output_uid);
+bool CoreAudioCapture::setup_process_tap() {
+    AudioDeviceID output_device = find_default_output_device();
+    if (output_device == kAudioObjectUnknown) {
+        fprintf(stderr, "Cannot find default output device\n");
         return false;
     }
 
-    // Build aggregate device description
-    CFMutableDictionaryRef agg_desc = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0,
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks
-    );
-
-    CFStringRef agg_uid = CFSTR("com.aec-recorder.aggregate");
-    CFDictionarySetValue(agg_desc, CFSTR(kAudioAggregateDeviceUIDKey), agg_uid);
-    CFDictionarySetValue(agg_desc, CFSTR(kAudioAggregateDeviceNameKey), CFSTR("AEC Recorder Aggregate"));
-
-    // Private aggregate device (not visible in system prefs)
-    int is_private = 1;
-    CFNumberRef private_val = CFNumberCreate(kCFAllocatorDefault, kCFNumberIntType, &is_private);
-    CFDictionarySetValue(agg_desc, CFSTR(kAudioAggregateDeviceIsPrivateKey), private_val);
-    CFRelease(private_val);
-
-    // Sub-devices: input (mic) and output (speaker for tap)
-    CFMutableArrayRef sub_devices = CFArrayCreateMutable(kCFAllocatorDefault, 0, &kCFTypeArrayCallBacks);
-
-    // Input sub-device
-    CFMutableDictionaryRef input_sub = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0,
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks
-    );
-    CFDictionarySetValue(input_sub, CFSTR(kAudioSubDeviceUIDKey), input_uid);
-    CFArrayAppendValue(sub_devices, input_sub);
-    CFRelease(input_sub);
-
-    // Output sub-device
-    CFMutableDictionaryRef output_sub = CFDictionaryCreateMutable(
-        kCFAllocatorDefault, 0,
-        &kCFTypeDictionaryKeyCallBacks,
-        &kCFTypeDictionaryValueCallBacks
-    );
-    CFDictionarySetValue(output_sub, CFSTR(kAudioSubDeviceUIDKey), output_uid);
-    CFArrayAppendValue(sub_devices, output_sub);
-    CFRelease(output_sub);
-
-    CFDictionarySetValue(agg_desc, CFSTR(kAudioAggregateDeviceSubDeviceListKey), sub_devices);
-    CFRelease(sub_devices);
-
-    // Create the aggregate device
-    OSStatus status = AudioHardwareCreateAggregateDevice(agg_desc, &aggregate_device_);
-    CFRelease(agg_desc);
-    CFRelease(input_uid);
-    CFRelease(output_uid);
-
-    if (status != noErr) {
-        fprintf(stderr, "Failed to create aggregate device: %d\n", (int)status);
+    CFStringRef output_uid = get_device_uid(output_device);
+    if (!output_uid) {
+        fprintf(stderr, "Cannot get output device UID\n");
         return false;
     }
 
-    // The aggregate device combines mic input + output device as sub-devices.
-    // The IOProc callback will receive both streams in input_data buffers.
+    // Get own process object ID to exclude from tap
+    AudioObjectID own_process = get_own_pid_object_id();
 
-    return true;
-}
+    if (@available(macOS 14.2, *)) {
+        CATapDescription *tapDesc = [[CATapDescription alloc] initMonoGlobalTapButExcludeProcesses:@[@(own_process)]];
+        tapDesc.UUID = [NSUUID UUID];
+        tapDesc.name = @"aec-recorder-tap";
+        tapDesc.privateTap = YES;
+        tapDesc.muteBehavior = CATapUnmuted;
 
-void CoreAudioCapture::destroy_aggregate_device() {
-    if (aggregate_device_ != kAudioObjectUnknown) {
-        AudioHardwareDestroyAggregateDevice(aggregate_device_);
-        aggregate_device_ = kAudioObjectUnknown;
-    }
-}
-
-OSStatus CoreAudioCapture::io_proc(AudioDeviceID device,
-                                   const AudioTimeStamp* now,
-                                   const AudioBufferList* input_data,
-                                   const AudioTimeStamp* input_time,
-                                   AudioBufferList* output_data,
-                                   const AudioTimeStamp* output_time,
-                                   void* client_data) {
-    auto* self = static_cast<CoreAudioCapture*>(client_data);
-    if (!self->running_.load()) return noErr;
-
-    // The aggregate device provides both mic and system audio in input_data
-    // Buffer 0 = mic input, Buffer 1 = system audio (from tap/output device)
-    const float* mic_data = nullptr;
-    const float* speaker_data = nullptr;
-    size_t frames = 0;
-
-    if (input_data && input_data->mNumberBuffers >= 2) {
-        mic_data = static_cast<const float*>(input_data->mBuffers[0].mData);
-        speaker_data = static_cast<const float*>(input_data->mBuffers[1].mData);
-        frames = input_data->mBuffers[0].mDataByteSize / sizeof(float);
-    } else if (input_data && input_data->mNumberBuffers == 1) {
-        // Interleaved or single buffer - treat as mic only
-        mic_data = static_cast<const float*>(input_data->mBuffers[0].mData);
-        frames = input_data->mBuffers[0].mDataByteSize / sizeof(float);
-    }
-
-    if (mic_data && frames > 0 && self->callback_) {
-        self->callback_(mic_data, speaker_data, frames);
-    }
-
-    // Silence output to avoid feedback
-    if (output_data) {
-        for (UInt32 i = 0; i < output_data->mNumberBuffers; ++i) {
-            memset(output_data->mBuffers[i].mData, 0, output_data->mBuffers[i].mDataByteSize);
-        }
-    }
-
-    return noErr;
-}
-
-bool CoreAudioCapture::start(const AudioCaptureConfig& config, AudioCaptureCallback callback) {
-    if (running_.load()) return false;
-
-    config_ = config;
-    callback_ = callback;
-
-    if (!create_aggregate_device()) {
-        fprintf(stderr, "Failed to create aggregate device, falling back to mic-only\n");
-        // Fallback: use default input device directly
-        aggregate_device_ = find_default_input_device();
-        if (aggregate_device_ == kAudioObjectUnknown) {
-            fprintf(stderr, "No input device available\n");
+        OSStatus err = AudioHardwareCreateProcessTap(tapDesc, &process_tap_id_);
+        if (err != noErr) {
+            fprintf(stderr, "Failed to create process tap: %d\n", (int)err);
+            CFRelease(output_uid);
             return false;
         }
+
+        // Read tap stream format
+        AudioStreamBasicDescription tapFormat = {};
+        UInt32 formatSize = sizeof(tapFormat);
+        AudioObjectPropertyAddress formatAddr = {
+            kAudioTapPropertyFormat,
+            kAudioObjectPropertyScopeGlobal,
+            kAudioObjectPropertyElementMain
+        };
+        err = AudioObjectGetPropertyData(process_tap_id_, &formatAddr, 0, nullptr, &formatSize, &tapFormat);
+        if (err != noErr) {
+            fprintf(stderr, "Failed to read tap format: %d\n", (int)err);
+        } else {
+            fprintf(stderr, "Tap format: sr=%.0f ch=%u\n", tapFormat.mSampleRate, tapFormat.mChannelsPerFrame);
+        }
+
+        // Create aggregate device with tap
+        NSString *outputUIDStr = (__bridge NSString *)output_uid;
+        NSString *tapUUIDStr = tapDesc.UUID.UUIDString;
+        NSString *aggregateUID = [NSUUID UUID].UUIDString;
+
+        NSDictionary *description = @{
+            @(kAudioAggregateDeviceNameKey): @"aec-recorder-systap",
+            @(kAudioAggregateDeviceUIDKey): aggregateUID,
+            @(kAudioAggregateDeviceMainSubDeviceKey): outputUIDStr,
+            @(kAudioAggregateDeviceIsPrivateKey): @YES,
+            @(kAudioAggregateDeviceIsStackedKey): @NO,
+            @(kAudioAggregateDeviceTapAutoStartKey): @YES,
+            @(kAudioAggregateDeviceSubDeviceListKey): @[
+                @{@(kAudioSubDeviceUIDKey): outputUIDStr},
+            ],
+            @(kAudioAggregateDeviceTapListKey): @[
+                @{
+                    @(kAudioSubTapDriftCompensationKey): @YES,
+                    @(kAudioSubTapUIDKey): tapUUIDStr,
+                },
+            ],
+        };
+
+        err = AudioHardwareCreateAggregateDevice((__bridge CFDictionaryRef)description, &tap_aggregate_device_);
+        CFRelease(output_uid);
+
+        if (err != noErr) {
+            fprintf(stderr, "Failed to create tap aggregate device: %d\n", (int)err);
+            AudioHardwareDestroyProcessTap(process_tap_id_);
+            process_tap_id_ = kAudioObjectUnknown;
+            return false;
+        }
+        fprintf(stderr, "Tap aggregate device created: %u\n", (unsigned)tap_aggregate_device_);
+
+        // Register IO proc for tap aggregate device (captures system audio)
+        __block CoreAudioCapture* selfPtr = this;
+        err = AudioDeviceCreateIOProcIDWithBlock(
+            &tap_io_proc_id_,
+            tap_aggregate_device_,
+            nullptr,
+            ^(const AudioTimeStamp* inNow,
+              const AudioBufferList* inInputData,
+              const AudioTimeStamp* inInputTime,
+              AudioBufferList* outOutputData,
+              const AudioTimeStamp* inOutputTime) {
+
+                if (!selfPtr->running_.load()) return;
+                if (!inInputData || inInputData->mNumberBuffers == 0) return;
+
+                const float* data = (const float*)inInputData->mBuffers[0].mData;
+                size_t frames = inInputData->mBuffers[0].mDataByteSize / sizeof(float);
+
+                // Write to speaker ring buffer
+                std::lock_guard<std::mutex> lock(selfPtr->speaker_mutex_);
+                for (size_t i = 0; i < frames; ++i) {
+                    selfPtr->speaker_ring_[selfPtr->speaker_write_pos_] = data[i];
+                    selfPtr->speaker_write_pos_ = (selfPtr->speaker_write_pos_ + 1) % SPEAKER_RING_SIZE;
+                }
+            }
+        );
+
+        if (err != noErr) {
+            fprintf(stderr, "Failed to create tap IO proc: %d\n", (int)err);
+            AudioHardwareDestroyAggregateDevice(tap_aggregate_device_);
+            tap_aggregate_device_ = kAudioObjectUnknown;
+            AudioHardwareDestroyProcessTap(process_tap_id_);
+            process_tap_id_ = kAudioObjectUnknown;
+            return false;
+        }
+
+        err = AudioDeviceStart(tap_aggregate_device_, tap_io_proc_id_);
+        if (err != noErr) {
+            fprintf(stderr, "Failed to start tap device: %d\n", (int)err);
+            AudioDeviceDestroyIOProcID(tap_aggregate_device_, tap_io_proc_id_);
+            tap_io_proc_id_ = nullptr;
+            AudioHardwareDestroyAggregateDevice(tap_aggregate_device_);
+            tap_aggregate_device_ = kAudioObjectUnknown;
+            AudioHardwareDestroyProcessTap(process_tap_id_);
+            process_tap_id_ = kAudioObjectUnknown;
+            return false;
+        }
+
+        fprintf(stderr, "Process tap started successfully\n");
+        return true;
+    } else {
+        fprintf(stderr, "macOS 14.4+ required for ProcessTap\n");
+        CFRelease(output_uid);
+        return false;
+    }
+}
+
+bool CoreAudioCapture::setup_mic_capture() {
+    mic_device_ = find_default_input_device();
+    if (mic_device_ == kAudioObjectUnknown) {
+        fprintf(stderr, "No input device available\n");
+        return false;
     }
 
     // Set buffer size
@@ -230,41 +256,112 @@ bool CoreAudioCapture::start(const AudioCaptureConfig& config, AudioCaptureCallb
         kAudioObjectPropertyScopeGlobal,
         kAudioObjectPropertyElementMain
     };
-    AudioObjectSetPropertyData(aggregate_device_, &buffer_addr, 0, nullptr, size, &buffer_frames);
+    AudioObjectSetPropertyData(mic_device_, &buffer_addr, 0, nullptr, size, &buffer_frames);
 
-    // Register IO proc
-    OSStatus status = AudioDeviceCreateIOProcID(aggregate_device_, io_proc, this, &io_proc_id_);
+    OSStatus status = AudioDeviceCreateIOProcID(mic_device_, mic_io_proc, this, &mic_io_proc_id_);
     if (status != noErr) {
-        fprintf(stderr, "Failed to create IO proc: %d\n", (int)status);
-        destroy_aggregate_device();
+        fprintf(stderr, "Failed to create mic IO proc: %d\n", (int)status);
         return false;
     }
 
-    // Start the device
-    status = AudioDeviceStart(aggregate_device_, io_proc_id_);
+    status = AudioDeviceStart(mic_device_, mic_io_proc_id_);
     if (status != noErr) {
-        fprintf(stderr, "Failed to start audio device: %d\n", (int)status);
-        AudioDeviceDestroyIOProcID(aggregate_device_, io_proc_id_);
-        io_proc_id_ = nullptr;
-        destroy_aggregate_device();
+        fprintf(stderr, "Failed to start mic device: %d\n", (int)status);
+        AudioDeviceDestroyIOProcID(mic_device_, mic_io_proc_id_);
+        mic_io_proc_id_ = nullptr;
         return false;
     }
+
+    fprintf(stderr, "Mic capture started\n");
+    return true;
+}
+
+OSStatus CoreAudioCapture::mic_io_proc(AudioDeviceID device,
+                                        const AudioTimeStamp* now,
+                                        const AudioBufferList* input_data,
+                                        const AudioTimeStamp* input_time,
+                                        AudioBufferList* output_data,
+                                        const AudioTimeStamp* output_time,
+                                        void* client_data) {
+    auto* self = static_cast<CoreAudioCapture*>(client_data);
+    if (!self->running_.load()) return noErr;
+    if (!input_data || input_data->mNumberBuffers == 0) return noErr;
+
+    const float* mic_data = static_cast<const float*>(input_data->mBuffers[0].mData);
+    size_t frames = input_data->mBuffers[0].mDataByteSize / sizeof(float);
+
+    // Read matching speaker data from ring buffer
+    std::vector<float> speaker_data(frames, 0.0f);
+    {
+        std::lock_guard<std::mutex> lock(self->speaker_mutex_);
+        size_t available = (self->speaker_write_pos_ - self->speaker_read_pos_ + SPEAKER_RING_SIZE) % SPEAKER_RING_SIZE;
+        size_t to_read = std::min(frames, available);
+        for (size_t i = 0; i < to_read; ++i) {
+            speaker_data[i] = self->speaker_ring_[self->speaker_read_pos_];
+            self->speaker_read_pos_ = (self->speaker_read_pos_ + 1) % SPEAKER_RING_SIZE;
+        }
+    }
+
+    if (self->callback_) {
+        self->callback_(mic_data, speaker_data.data(), frames);
+    }
+
+    return noErr;
+}
+
+bool CoreAudioCapture::start(const AudioCaptureConfig& config, AudioCaptureCallback callback) {
+    if (running_.load()) return false;
+
+    config_ = config;
+    callback_ = callback;
+    speaker_ring_.resize(SPEAKER_RING_SIZE, 0.0f);
+    speaker_write_pos_ = 0;
+    speaker_read_pos_ = 0;
 
     running_ = true;
+
+    if (!setup_mic_capture()) {
+        running_ = false;
+        teardown();
+        return false;
+    }
+
+    bool tap_ok = setup_process_tap();
+    if (!tap_ok) {
+        fprintf(stderr, "Warning: system audio capture unavailable, speaker_ref will be silent\n");
+    }
+
     return true;
 }
 
 void CoreAudioCapture::stop() {
     if (!running_.load()) return;
     running_ = false;
+    teardown();
+}
 
-    if (io_proc_id_) {
-        AudioDeviceStop(aggregate_device_, io_proc_id_);
-        AudioDeviceDestroyIOProcID(aggregate_device_, io_proc_id_);
-        io_proc_id_ = nullptr;
+void CoreAudioCapture::teardown() {
+    if (mic_io_proc_id_) {
+        AudioDeviceStop(mic_device_, mic_io_proc_id_);
+        AudioDeviceDestroyIOProcID(mic_device_, mic_io_proc_id_);
+        mic_io_proc_id_ = nullptr;
     }
 
-    destroy_aggregate_device();
+    if (tap_io_proc_id_) {
+        AudioDeviceStop(tap_aggregate_device_, tap_io_proc_id_);
+        AudioDeviceDestroyIOProcID(tap_aggregate_device_, tap_io_proc_id_);
+        tap_io_proc_id_ = nullptr;
+    }
+
+    if (tap_aggregate_device_ != kAudioObjectUnknown) {
+        AudioHardwareDestroyAggregateDevice(tap_aggregate_device_);
+        tap_aggregate_device_ = kAudioObjectUnknown;
+    }
+
+    if (process_tap_id_ != kAudioObjectUnknown) {
+        AudioHardwareDestroyProcessTap(process_tap_id_);
+        process_tap_id_ = kAudioObjectUnknown;
+    }
 }
 
 std::unique_ptr<AudioCapture> create_audio_capture() {
