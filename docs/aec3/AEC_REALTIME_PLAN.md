@@ -212,27 +212,37 @@ AEC处理:      ~10ms (WebRTC AEC3 一帧)
 ## 文件结构规划
 
 ```
-aec-recorder/
-├── CMakeLists.txt                 # 顶层构建
-├── src/
-│   ├── core/
-│   │   ├── aec_processor.h/cpp    # WebRTC AEC3 封装
-│   │   ├── resampler.h/cpp        # 48k→16k 重采样
-│   │   └── ring_buffer.h/cpp      # 环形缓冲区
-│   ├── platform/
-│   │   ├── audio_capture.h        # 平台抽象接口
-│   │   ├── macos/
-│   │   │   └── coreaudio_capture.mm  # macOS CoreAudio实现
-│   │   └── windows/
-│   │       └── wasapi_capture.cpp    # Windows WASAPI实现
-│   ├── output/
-│   │   └── wav_writer.h/cpp       # 三路WAV文件输出
-│   └── main.cpp                   # 入口/CLI
-├── third_party/
-│   └── webrtc/                    # WebRTC AEC3 模块（精简提取）
-└── scripts/
-    ├── build_mac.sh
-    └── build_win.bat
+docs/
+└── aec3/
+    └── AEC_REALTIME_PLAN.md       # 当前方案文档
+
+modules/
+└── aec3-recorder/
+    ├── CMakeLists.txt             # AEC3录音模块构建
+    ├── include/
+    │   └── aec3_recorder/
+    │       ├── recorder.h         # 对外入口
+    │       └── audio_frame.h      # 统一音频帧结构
+    ├── src/
+    │   ├── core/
+    │   │   ├── aec_processor.h/cpp    # WebRTC AEC3 封装
+    │   │   ├── resampler.h/cpp        # 48k→16k 重采样
+    │   │   └── ring_buffer.h/cpp      # 环形缓冲区
+    │   ├── platform/
+    │   │   ├── audio_capture.h        # 平台抽象接口
+    │   │   ├── macos/
+    │   │   │   └── coreaudio_capture.mm  # macOS CoreAudio实现
+    │   │   └── windows/
+    │   │       └── wasapi_capture.cpp    # Windows WASAPI实现
+    │   ├── output/
+    │   │   └── wav_writer.h/cpp       # 三路WAV文件输出
+    │   └── cli/
+    │       └── main.cpp               # 测试CLI入口
+    ├── third_party/
+    │   └── webrtc/                # WebRTC AEC3 模块（精简提取）
+    └── scripts/
+        ├── build_mac.sh
+        └── build_win.bat
 ```
 
 ---
