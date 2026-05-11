@@ -1,8 +1,16 @@
-# 面试场景实时AEC + WebSocket方案设计
+# 面试场景实时AEC3音频输出方案设计
 
 ## Context
 
-面试场景中，从麦克风录音里去除扬声器播放的声音（对方说话声），只保留自己的声音，实时通过WebSocket发送到后端做ASR。延迟要求200ms以内。需要支持macOS和Windows双端。
+面试场景中，从麦克风录音里去除扬声器播放的声音（对方说话声），只保留自己的声音。
+
+当前阶段只做本地音频采集、对齐、AEC3处理和音频文件输出。程序运行后需要输出3个音频文件：
+
+1. 原始麦克风音频：`mic_raw.wav`
+2. 扬声器参考音频：`speaker_ref.wav`
+3. AEC3处理后的音频：`aec3_output.wav`
+
+需要支持macOS和Windows双端。延迟要求仍以200ms以内为实时能力参考，但当前验收重点是三路音频能正确生成，并且 `aec3_output.wav` 中扬声器回声明显降低。
 
 之前的方案（Swift层分别采集麦克风和系统音频再对齐）存在对齐困难的bug，导致消音效果差。
 
@@ -62,20 +70,20 @@
 
 **缺点：**
 - 黑盒，无法调参
-- macOS VPIO 会自动启用AGC和噪声抑制，可能影响ASR质量
+- macOS VPIO 会自动启用AGC和噪声抑制，可能影响后续语音处理质量
 - Windows上系统AEC质量参差不齐，依赖声卡驱动
 - 某些场景下（外接音箱、蓝牙耳机）效果会下降
 
 ---
 
-## 推荐方案：方案A（C++同步采集 + WebRTC AEC3）
+## 推荐方案：方案A（C++同步采集 + WebRTC AEC3 + 本地WAV输出）
 
 **理由：**
 1. 之前的问题就是对齐，方案A从根本上解决对齐问题
-2. 面试场景对消音质量要求高（残留回声会被ASR识别为噪声文本）
+2. 面试场景对消音质量要求高，残留回声会混进目标人声
 3. WebRTC AEC3是业界最成熟的开源方案
 4. 跨平台统一架构，维护成本可控
-5. 200ms延迟预算充裕（AEC处理本身只需10-20ms）
+5. 当前阶段先输出本地音频文件，方便直接检查波形和听感，降低验证复杂度
 
 ---
 
@@ -83,17 +91,18 @@
 
 ```
 ┌─────────────────────────────────────────────────────────┐
-│                    应用层 (Electron/CLI)                   │
+│                    应用层 (CLI/测试程序)                    │
 ├─────────────────────────────────────────────────────────┤
-│                  C++ 核心库 (libaec_stream)                │
+│                  C++ 核心库 (libaec_recorder)              │
 │                                                           │
-│  ┌──────────────┐   ┌──────────────┐   ┌─────────────┐  │
-│  │ Platform Audio│   │  AEC Engine  │   │  WebSocket  │  │
-│  │   Capture    │──>│  (WebRTC)    │──>│   Sender    │  │
-│  │              │   │              │   │             │  │
-│  │ • Mic Input  │   │ • analyze()  │   │ • PCM16/Opus│  │
-│  │ • Speaker Out│   │ • process()  │   │ • 实时推送   │  │
-│  └──────────────┘   └──────────────┘   └─────────────┘  │
+│  ┌──────────────┐   ┌──────────────┐   ┌──────────────┐ │
+│  │ Platform Audio│   │  AEC Engine  │   │ Audio Writer │ │
+│  │   Capture    │──>│  (WebRTC)    │──>│    (WAV)     │ │
+│  │              │   │              │   │              │ │
+│  │ • Mic Input  │   │ • analyze()  │   │ • mic_raw    │ │
+│  │ • Speaker Out│   │ • process()  │   │ • speaker_ref│ │
+│  │              │   │              │   │ • aec3_output│ │
+│  └──────────────┘   └──────────────┘   └──────────────┘ │
 ├─────────────────────────────────────────────────────────┤
 │              平台抽象层 (Platform Abstraction)              │
 │                                                           │
@@ -156,44 +165,46 @@ public:
 ```
 
 **参数选择：**
-- 采样率：16000Hz（ASR标准，降低计算量）
+- 采样率：16000Hz（语音处理常用规格，降低计算量）
 - 帧大小：160 samples（10ms）
 - 通道：单声道
 
 **为什么用16kHz而不是48kHz：**
-- ASR后端通常接受16kHz
+- 人声频段下16kHz已经足够验证AEC效果
 - AEC在16kHz下计算量是48kHz的1/9
-- 减少WebSocket带宽
+- 输出文件更小，便于快速验证
 - 从48kHz采集后重采样到16kHz即可
 
-### 3. WebSocket发送模块
+### 3. 音频文件输出模块
 
 ```
-数据格式：PCM16 @ 16kHz mono
-发送间隔：每100ms发送一次（1600 samples = 3200 bytes）
-协议：二进制WebSocket帧
-
-帧格式：
-[4 bytes: timestamp_ms][N bytes: PCM16 data]
+输出格式：WAV / PCM16 / 16kHz / mono
+输出文件：
+- mic_raw.wav：原始麦克风输入
+- speaker_ref.wav：扬声器/系统声音参考信号
+- aec3_output.wav：WebRTC AEC3处理后的音频
 ```
 
-**可选：Opus编码**
-- 如果带宽有限，可以用Opus编码（20ms帧，约3.2kbps @ 16kbps bitrate）
-- 但会增加约5ms编码延迟
-- 建议先用PCM16，带宽不是问题时最简单
+**写入策略：**
+- 每处理完一帧10ms音频，同时写入三路WAV
+- 录制开始时先写占位WAV头
+- 录制结束时回填 `RIFF` 和 `data` 长度
+- 三个文件必须使用同样的采样率、通道数和起始时间，方便后续波形对比
+- 如果采集端是48kHz，建议同时保留内部48kHz处理链路，再统一输出16kHz PCM16
 
 ---
 
 ## 延迟分析
 
+当前阶段只输出本地文件，延迟主要用于评估后续实时化可行性。
+
 ```
 采集延迟:     ~10ms (音频硬件buffer)
 重采样:       ~1ms  (48k→16k)
 AEC处理:      ~10ms (WebRTC AEC3 一帧)
-缓冲+打包:    ~100ms (攒够100ms数据发送)
-WebSocket传输: ~5ms  (局域网/本地)
+文件写入:      ~1ms  (顺序写WAV)
 ─────────────────────────────────
-总计:         ~126ms < 200ms ✓
+单帧链路:     ~22ms < 200ms ✓
 ```
 
 ---
@@ -201,7 +212,7 @@ WebSocket传输: ~5ms  (局域网/本地)
 ## 文件结构规划
 
 ```
-aec-stream/
+aec-recorder/
 ├── CMakeLists.txt                 # 顶层构建
 ├── src/
 │   ├── core/
@@ -214,8 +225,8 @@ aec-stream/
 │   │   │   └── coreaudio_capture.mm  # macOS CoreAudio实现
 │   │   └── windows/
 │   │       └── wasapi_capture.cpp    # Windows WASAPI实现
-│   ├── transport/
-│   │   └── ws_sender.h/cpp        # WebSocket发送
+│   ├── output/
+│   │   └── wav_writer.h/cpp       # 三路WAV文件输出
 │   └── main.cpp                   # 入口/CLI
 ├── third_party/
 │   └── webrtc/                    # WebRTC AEC3 模块（精简提取）
@@ -267,28 +278,26 @@ aec-stream/
 ### Phase 1: macOS 原型（1-2天）
 1. 搭建CMake项目骨架
 2. 实现CoreAudio全双工采集（Aggregate Device方案）
-3. 验证两路数据对齐（输出到WAV文件，人工检查波形）
+3. 实现WAV输出模块
+4. 输出 `mic_raw.wav` 和 `speaker_ref.wav`，人工检查两路波形是否对齐
 
 ### Phase 2: 集成WebRTC AEC3（1-2天）
-4. 提取WebRTC AEC3模块（或用预编译库）
-5. 实现48k→16k重采样
-6. 接入AEC处理，验证消音效果
+5. 提取WebRTC AEC3模块（或用预编译库）
+6. 实现48k→16k重采样
+7. 接入AEC处理，输出 `aec3_output.wav`
+8. 对比三路音频，验证消音效果
 
-### Phase 3: WebSocket传输（半天）
-7. 集成轻量WebSocket库（如 libwebsockets 或 ixwebsocket）
-8. 实现PCM16实时推送
-9. 写一个简单的后端接收端验证
-
-### Phase 4: Windows移植（2-3天）
-10. 实现WASAPI双流采集
-11. 实现QPC时间戳对齐
-12. 验证跨平台构建
+### Phase 3: Windows移植（2-3天）
+9. 实现WASAPI双流采集
+10. 实现QPC时间戳对齐
+11. 输出同样的三路WAV文件
+12. 验证跨平台构建和音频效果
 
 ---
 
 ## 验证方法
 
 1. **对齐验证：** 播放已知信号（如chirp），同时录制麦克风和loopback，检查两路波形的时间偏移是否<1ms
-2. **AEC效果验证：** 播放音乐/语音，同时对着麦克风说话，检查输出中是否只有自己的声音
-3. **延迟验证：** 在后端记录收到音频的时间戳，与说话时间对比
-4. **ASR验证：** 将输出接入ASR引擎，检查识别准确率
+2. **输出文件验证：** 每次运行后必须生成 `mic_raw.wav`、`speaker_ref.wav`、`aec3_output.wav` 三个文件
+3. **AEC效果验证：** 播放音乐/语音，同时对着麦克风说话，检查 `aec3_output.wav` 中是否主要保留自己的声音
+4. **波形验证：** 用Audacity等工具对比三路波形，确认 `aec3_output.wav` 中扬声器参考信号被明显压低
